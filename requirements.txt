@@ -1,0 +1,14 @@
+# Core AI & LangGraph
+langchain
+langgraph
+langchain-groq
+
+# Environment config
+python-dotenv
+
+# FastAPI WebSocket backend
+fastapi
+uvicorn
+
+# (Optional) For local dev WebSocket testing via Python
+websockets
