@@ -1,14 +1,15 @@
-# Core AI & LangGraph
-langchain
-langgraph
-langchain-groq
+# --- requirements.txt ---
+# Install these using: pip install -r requirements.txt
 
-# Environment config
-python-dotenv
-
-# FastAPI WebSocket backend
 fastapi
-uvicorn
-
-# (Optional) For local dev WebSocket testing via Python
-websockets
+uvicorn[standard]
+python-dotenv
+langgraph
+langchain
+langchain-groq
+requests
+pydantic
+Pillow # For creating the placeholder image
+uuid # For react app
+marked # For react app
+ 

@@ -1,0 +1,1 @@
+visual_prompt = 'Generate a visual prompt based on branding suggestions...'

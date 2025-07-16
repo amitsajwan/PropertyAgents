@@ -1,121 +1,134 @@
+import os
 import asyncio
 import logging
+import json
+from typing import Dict
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-from typing import Dict
+from fastapi.staticfiles import StaticFiles
+from langchain_core.runnables import RunnableConfig
 
 from branding_to_post_graph import build_graph, BrandingPostState
 
-# --- Configuration ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# --- Logging Setup ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(client_id)s] - %(message)s')
+logger = logging.getLogger("realestate-ai")
 
-app = FastAPI()
-
-# --- CORS Middleware ---
-# Allows the frontend to connect to this backend
+# --- FastAPI App Setup ---
+app = FastAPI(title="Real Estate AI Assistant Backend")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict this to your frontend's domain
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- WebSocket Connection Manager ---
+os.makedirs("generated_images", exist_ok=True)
+app.mount("/generated_images", StaticFiles(directory="generated_images"), name="generated_images")
+
+# --- Connection Manager ---
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
-        self.graphs: Dict[str, any] = {}
+        self.states: Dict[str, BrandingPostState] = {}
+        self.graph = build_graph()
 
-    async def connect(self, websocket: WebSocket, client_id: str):
-        await websocket.accept()
-        self.active_connections[client_id] = websocket
-        self.graphs[client_id] = build_graph()
-        logger.info(f"Client connected: {client_id}")
+    async def connect(self, client_id: str, ws: WebSocket):
+        await ws.accept()
+        self.active_connections[client_id] = ws
+        self.states[client_id] = BrandingPostState(client_id=client_id)
+        logger.info("Client connected", extra={"client_id": client_id})
 
     def disconnect(self, client_id: str):
-        del self.active_connections[client_id]
-        del self.graphs[client_id]
-        logger.info(f"Client disconnected: {client_id}")
+        self.active_connections.pop(client_id, None)
+        self.states.pop(client_id, None)
+        logger.info("Client disconnected", extra={"client_id": client_id})
 
-    async def send_json(self, client_id: str, data: dict):
-        """Sends a JSON message to a specific client."""
-        if client_id in self.active_connections:
-            await self.active_connections[client_id].send_json(data)
+    async def run_graph_part(self, client_id: str, state_update: dict):
+        """Merges updates into the current state and runs the LangGraph workflow."""
+        current_state = self.states.get(client_id)
+        if not current_state:
+            logger.error(f"No state found for client {client_id}", extra={"client_id": client_id})
+            return
+
+        # If for any reason the state is still a dict, convert it safely
+        if isinstance(current_state, dict):
+            try:
+                current_state = BrandingPostState(**current_state)
+            except Exception as e:
+                logger.exception("Failed to convert dict to BrandingPostState")
+                await self.active_connections[client_id].send_json({"type": "error", "message": str(e)})
+                return
+
+        try:
+            self.states[client_id] = current_state = current_state.copy()
+        except Exception as e:
+            logger.exception("Failed to update state")
+            await self.active_connections[client_id].send_json({"type": "error", "message": str(e)})
+            return
+
+        config = RunnableConfig(configurable={"client_id": client_id, "websocket": self.active_connections.get(client_id)})
+
+        try:
+            async for event in self.graph.astream_events(current_state, config, version="v1"):
+                kind = event["event"]
+                if kind == "on_chain_end" and event["name"] != "root":
+                    node_name = event["name"]
+                    output = event["data"].get("output")
+                    if output:
+                        if isinstance(current_state, dict):
+                            current_state = BrandingPostState(**current_state)
+                        self.states[client_id] = current_state = current_state.copy()
+                        await self.active_connections[client_id].send_json({
+                            "type": "update",
+                            "step": node_name,
+                            "data": output
+                        })
+        except Exception as e:
+            logger.exception(f"Error during graph execution for client {client_id}")
+            await self.active_connections[client_id].send_json({"type": "error", "message": str(e)})
 
 manager = ConnectionManager()
 
 # --- WebSocket Endpoint ---
 @app.websocket("/chat/{client_id}")
-async def websocket_endpoint(websocket: WebSocket, client_id: str):
-    await manager.connect(websocket, client_id)
-    
+async def chat_ws(ws: WebSocket, client_id: str):
+    await manager.connect(client_id, ws)
     try:
         while True:
-            # Wait for a message from the client
-            data = await websocket.receive_json()
-            user_input = data.get("user_input")
-            details = data.get("details")
+            raw_data = await ws.receive_text()
+            message = json.loads(raw_data)
 
-            graph = manager.graphs[client_id]
-            
-            # Initial state for the graph run
-            if user_input:
-                initial_state = BrandingPostState(user_input=user_input, websocket=websocket, client_id=client_id)
-            elif details:
-                # This is for when the user submits the property details form
-                initial_state = BrandingPostState(
-                    location=details.get("location"),
-                    price=details.get("price"),
-                    bedrooms=details.get("bedrooms"),
-                    features=details.get("features", "").split(','),
-                    websocket=websocket,
-                    client_id=client_id
-                )
-            else:
-                await manager.send_json(client_id, {"type": "error", "message": "Invalid input"})
-                continue
+            state_update = {}
+            message_type = message.get("type")
 
-            # Stream the graph execution events
-            async for event in graph.astream_events(initial_state, version="v1"):
-                kind = event["event"]
-                
-                if kind == "on_chain_end":
-                    node_name = event["name"]
-                    output = event["data"].get("output")
-                    
-                    if output:
-                        # Send the output of each step to the client
-                        await manager.send_json(client_id, {
-                            "type": "update",
-                            "step": node_name,
-                            "data": output
-                        })
+            if message_type == "initial_input":
+                state_update["user_input"] = message.get("user_input")
+                asyncio.create_task(manager.run_graph_part(client_id, state_update))
 
-                        # If the graph is waiting for info, let the frontend know
-                        if node_name == "check_requirements" and output.get("missing_info"):
-                             await manager.send_json(client_id, {
-                                "type": "request_input",
-                                "fields": output["missing_info"]
-                            })
-
-            await manager.send_json(client_id, {"type": "final", "message": "Workflow complete."})
-
+            elif message_type == "details_input":
+                details = message.get("details", {})
+                state_update.update({
+                    "location": details.get("location"),
+                    "price": details.get("price"),
+                    "bedrooms": details.get("bedrooms"),
+                    "features": [f.strip() for f in details.get("features", "").split(',')],
+                    "missing_info": []
+                })
+                asyncio.create_task(manager.run_graph_part(client_id, state_update))
 
     except WebSocketDisconnect:
         manager.disconnect(client_id)
     except Exception as e:
-        logger.error(f"Error for client {client_id}: {e}")
-        await manager.send_json(client_id, {"type": "error", "message": str(e)})
+        logger.error(f"Unhandled error in websocket for client {client_id}: {e}")
         manager.disconnect(client_id)
 
-# --- Root Endpoint ---
+# --- Root Check ---
 @app.get("/")
-def read_root():
-    return {"message": "Real Estate AI Assistant Backend is running."}
+def root():
+    return {"message": "Real Estate AI Assistant Backend is running!"}
 
-# --- Main execution ---
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
